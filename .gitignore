@@ -1,0 +1,19 @@
+# Python
+## Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env
+
+# Generated reports
+*.csv
+
+# IDE configuration
+.idea/
+.vscode/
