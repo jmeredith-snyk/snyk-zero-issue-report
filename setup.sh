@@ -23,8 +23,8 @@ echo "Activating virtual environment..."
 source venv/bin/activate
 
 # Install dependencies
-echo "Installing dependencies..."
-pip install requests python-dotenv
+echo "Installing dependencies from requirements.txt..."
+pip install -r requirements.txt
 
 # Check if .env file exists
 if [ ! -f ".env" ]; then

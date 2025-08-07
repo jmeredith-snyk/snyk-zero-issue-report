@@ -18,6 +18,8 @@ Configuration:
   Create a .env file with: SNYK_TOKEN="your_snyk_api_token_here"
 """
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import os
 import csv
 import sys
@@ -25,7 +27,6 @@ import argparse
 import logging
 import concurrent.futures
 import time
-import random
 from dotenv import load_dotenv
 
 # --- Global Configuration ---
@@ -47,10 +48,6 @@ SEVERITY_MAP = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
 MAX_WORKERS = 8  # Number of concurrent API calls (increased for better performance)
 BATCH_SIZE = 5   # Number of organizations to process in parallel (reduced for stability)
 
-# Rate limiting configuration
-RATE_LIMIT_DELAY = 0.1  # 100ms delay between API calls to avoid rate limiting
-RATE_LIMIT_JITTER = 0.05  # Add random jitter to prevent thundering herd
-
 # --- Snyk API Client ---
 class SnykClient:
     """
@@ -58,12 +55,13 @@ class SnykClient:
     
     This class handles all API communication with Snyk, including:
     - Authentication via API token
+    - Automatic retries with exponential backoff for rate limiting and server errors
     - Pagination handling for large datasets
     - Error handling and logging
     - Data retrieval for groups, organizations, projects, and issues
     """
     
-    def __init__(self, snyk_token, timeout=30):
+    def __init__(self, snyk_token, timeout=60):
         """
         Initialize the Snyk API client.
         
@@ -77,30 +75,95 @@ class SnykClient:
         if not snyk_token:
             raise ValueError("Snyk token is required.")
         
-        # Set up authentication headers for API requests
-        self.headers = {
+        self.timeout = timeout
+        self.session = self._create_session(snyk_token)
+
+    def _create_session(self, snyk_token):
+        """
+        Creates a requests.Session with retry logic and default headers.
+
+        This setup provides resilience against transient network issues,
+        server-side errors (5xx), and rate limiting (429).
+
+        Args:
+            snyk_token (str): The Snyk API token.
+
+        Returns:
+            requests.Session: A configured session object.
+        """
+        session = requests.Session()
+
+        # Define the retry strategy
+        retry_strategy = Retry(
+            total=5,  # Total number of retries
+            backoff_factor=1,  # Factor for exponential backoff (e.g., 1s, 2s, 4s, ...)
+            status_forcelist=[429, 500, 502, 503, 504],  # HTTP status codes to retry on
+            allowed_methods=["GET"] # Only retry on GET requests
+        )
+
+        # Mount the retry strategy to an HTTP adapter
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+
+        # Set default headers for the session
+        session.headers.update({
             "Authorization": f"token {snyk_token}",
             "Accept": "application/vnd.api+json"
-        }
-        self.timeout = timeout
+        })
+
+        return session
+
+    def _request(self, method, url, params=None):
+        """
+        Makes an API request using the configured session.
+
+        Args:
+            method (str): HTTP method (e.g., 'GET')
+            url (str): The API endpoint URL
+            params (dict, optional): Query parameters for the request
+
+        Returns:
+            requests.Response: The response object
+
+        Raises:
+            requests.exceptions.RequestException: For connection errors or if retries fail.
+            SystemExit: For critical, non-retriable errors like 401/403.
+        """
+        try:
+            response = self.session.request(method, url, params=params, timeout=self.timeout)
+            response.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
+            return response
+        except requests.exceptions.HTTPError as e:
+            # Handle specific, non-retriable HTTP errors
+            if e.response.status_code in [401, 403]:
+                log.error(f"Authentication failed (HTTP {e.response.status_code}). Please check your SNYK_TOKEN.")
+            elif e.response.status_code == 404:
+                log.error(f"Resource not found (HTTP 404) at {url}. Check the provided ID.")
+            else:
+                # For other HTTP errors, log the details
+                error_details = e.response.text.replace('\n', ' ').replace('\r', '')
+                log.error(f"HTTP Error {e.response.status_code} for {url}: {error_details}")
+            # Exit for critical errors that shouldn't proceed
+            sys.exit(1)
+        except requests.exceptions.RequestException as e:
+            # Handle other request exceptions (e.g., network issues)
+            log.error(f"API request failed for {url}: {e}")
+            raise  # Re-raise the exception to be handled by the caller
 
     def _get_paginated_data(self, url, params=None):
         """
-        Handles pagination for Snyk API GET requests with rate limiting.
+        Handles pagination for Snyk API GET requests using the session's retry logic.
         
         The Snyk API uses pagination for large datasets. This method automatically
-        follows the 'next' links to retrieve all available data with proper rate limiting.
+        follows the 'next' links to retrieve all available data.
         
         Args:
             url (str): The API endpoint URL
-            params (dict): Query parameters for the request
+            params (dict, optional): Query parameters for the request
             
         Returns:
-            list: All items from all pages combined
-            
-        Note:
-            This method includes comprehensive error handling, logging,
-            and rate limiting to avoid hitting API limits.
+            list: All items from all pages combined, or an empty list on failure.
         """
         items = []
         current_url = url
@@ -109,39 +172,26 @@ class SnykClient:
         while current_url:
             log.debug(f"Fetching page from {current_url} with params: {current_params}")
             try:
-                # Rate limiting: Add delay between API calls
-                if items:  # Skip delay for first request
-                    delay = RATE_LIMIT_DELAY + random.uniform(0, RATE_LIMIT_JITTER)
-                    time.sleep(delay)
-                
-                # Make the API request
-                response = requests.get(current_url, headers=self.headers, params=current_params, timeout=self.timeout)
-                response.raise_for_status()
+                response = self._request("GET", current_url, params=current_params)
                 data = response.json()
                 
-                # Extract items from the current page
                 page_items = data.get("data", [])
                 items.extend(page_items)
                 log.debug(f"  -> Found {len(page_items)} items on this page. Total items: {len(items)}")
                 
-                # Check for next page link
+                # Check for the next page link
                 next_link = data.get("links", {}).get("next")
                 if next_link:
+                    # The 'next' link is a full path, so we construct the full URL
                     current_url = f"https://api.snyk.io{next_link}"
                     current_params = {}  # Subsequent requests use the full URL from 'next' link
-                    log.debug(f"  -> Next page link found: {current_url}")
                 else:
-                    current_url = None
+                    current_url = None  # No more pages
                     
-            except requests.exceptions.RequestException as e:
-                error_details = ""
-                if e.response:
-                    # Sanitize response body to prevent log injection
-                    response_body = e.response.text.replace('\n', ' ').replace('\r', '')
-                    error_details = f"  - Status: {e.response.status_code}, Body: {response_body}"
-                log.error(f"API Error fetching data from {url}:\n{e}\n{error_details}")
-                # Return what we have so far, or an empty list
-                return items
+            except requests.exceptions.RequestException:
+                # Error is already logged in _request, just return what we have
+                log.error(f"Stopping pagination for {url} due to previous errors.")
+                return items  # Return partial data or an empty list
         return items
 
     def get_name(self, entity_type, entity_id):
@@ -153,15 +203,16 @@ class SnykClient:
             entity_id (str): ID of the entity to fetch
             
         Returns:
-            str: The name of the entity, or "Unknown Name" if not found
+            str: The name of the entity, or "Unknown Name" if not found.
         """
-        url = f"{API_BASE_URL}/{entity_type}/{entity_id}?version={API_VERSION}"
+        url = f"{API_BASE_URL}/{entity_type}/{entity_id}"
+        params = {"version": API_VERSION}
         try:
-            response = requests.get(url, headers=self.headers, timeout=self.timeout)
-            response.raise_for_status()
+            response = self._request("GET", url, params=params)
             return response.json().get("data", {}).get("attributes", {}).get("name", "Unknown Name")
-        except requests.exceptions.RequestException as e:
-            log.warning(f"Could not fetch info for {entity_type} ID {entity_id}: {e}")
+        except requests.exceptions.RequestException:
+            # Error is already logged in _request, return a default value
+            log.warning(f"Could not fetch name for {entity_type} ID {entity_id}, continuing with 'Unknown Name'.")
             return "Unknown Name"
 
     def get_orgs_in_group(self, group_id):
@@ -511,10 +562,6 @@ def parse_detailed_issue(issue, project_map, org_name=None):
     issue_type = attributes.get("type")
     project_name = project_map.get(project_id, "Unknown Project")
     
-    # Extract basic issue information
-    issue_type = attributes.get("type")
-    project_name = project_map.get(project_id, "Unknown Project")
-    
     # Extract problem data (common for most types)
     problem = attributes.get("problem", {})
     problems = attributes.get("problems", [])
@@ -542,25 +589,29 @@ def parse_detailed_issue(issue, project_map, org_name=None):
     # Extract package/resource information from coordinates
     package_info = "N/A"
     coordinates = attributes.get("coordinates", [])
-    if coordinates and len(coordinates) > 0:
-        representations = coordinates[0].get("representations", [])
-        if representations and len(representations) > 0:
-            representation = representations[0]
-            
-            # For code issues, extract file path from sourceLocation
-            if issue_type == "code" and "sourceLocation" in representation:
-                source_location = representation["sourceLocation"]
-                file_path = source_location.get("file", "N/A")
+    if coordinates:
+        # The first coordinate usually has the most relevant info
+        primary_coord = coordinates[0]
+        representations = primary_coord.get("representations", [])
+
+        # Find the most specific representation (dependency, sourceLocation, etc.)
+        for rep in representations:
+            if "dependency" in rep:
+                dep = rep["dependency"]
+                name = dep.get("package_name", "")
+                version = dep.get("package_version", "")
+                if name:
+                    package_info = f"{name}@{version}" if version else name
+                    break  # Found a good identifier
+            elif "sourceLocation" in rep and issue_type == "code":
+                file_path = rep["sourceLocation"].get("file", "N/A")
                 if file_path != "N/A":
                     package_info = file_path
-            
-            # For package_vulnerability and license issues, extract package info from dependency
-            elif "dependency" in representation:
-                dependency = representation["dependency"]
-                package_name = dependency.get("package_name", "")
-                package_version = dependency.get("package_version", "")
-                if package_name:
-                    package_info = f"{package_name}@{package_version}" if package_version else package_name
+                    break # Found a file path for code issue
+
+    # Fallback for older issue types or different structures
+    if package_info == "N/A":
+        package_info = extract_package_info(issue_type, attributes.get("resources", []))
 
     # Extract timestamps - try different possible field names
     created_at = attributes.get("createdAt") or attributes.get("created_at") or ""
@@ -687,7 +738,7 @@ def run_org_report(client, org_id, limit, detailed=False):
     output_filename = f"snyk_org_report_{org_id}_{report_type}.csv"
     write_csv_report(report_data, output_filename, is_group_report=False, is_detailed=detailed)
 
-def run_group_report(client, group_id, limit, detailed=False, max_workers=MAX_WORKERS):
+def run_group_report(client, group_id, limit, detailed=False, max_workers=MAX_WORKERS, batch_size=BATCH_SIZE):
     """
     Generates a report for all organizations in a group using concurrent processing.
     
@@ -702,6 +753,8 @@ def run_group_report(client, group_id, limit, detailed=False, max_workers=MAX_WO
         group_id (str): The Snyk Group ID
         limit (int, optional): Maximum number of projects to process per organization
         detailed (bool): Whether to generate a detailed report (default: False)
+        max_workers (int): Number of concurrent workers for processing
+        batch_size (int): Number of organizations to process in a single batch
     """
     log.info(f"Running report for Group ID: {group_id}")
     group_name = client.get_name("groups", group_id)
@@ -721,9 +774,9 @@ def run_group_report(client, group_id, limit, detailed=False, max_workers=MAX_WO
     all_report_data = []
     
     # Process organizations in batches
-    for i in range(0, len(organizations), BATCH_SIZE):
-        batch = organizations[i:i + BATCH_SIZE]
-        log.info(f"Processing batch {i//BATCH_SIZE + 1}/{(len(organizations) + BATCH_SIZE - 1)//BATCH_SIZE} ({len(batch)} organizations)")
+    for i in range(0, len(organizations), batch_size):
+        batch = organizations[i:i + batch_size]
+        log.info(f"Processing batch {i//batch_size + 1}/{(len(organizations) + batch_size - 1)//batch_size} ({len(batch)} organizations)")
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all organizations in this batch for concurrent processing
@@ -777,7 +830,10 @@ Examples:
     parser.add_argument("--limit", type=int, help="Limit the number of projects processed per organization.")
     parser.add_argument("--detailed", action="store_true", help="Generate a detailed, per-issue report instead of a summary.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging for verbose output.")
-    parser.add_argument("--workers", type=int, default=MAX_WORKERS, help=f"Number of concurrent workers (default: {MAX_WORKERS})")    
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS, help=f"Number of concurrent workers (default: {MAX_WORKERS}).")
+    parser.add_argument("--timeout", type=int, default=60, help="Request timeout in seconds (default: 60).")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help=f"Number of orgs to process in a batch (default: {BATCH_SIZE}).")
+
     args = parser.parse_args()
 
     # Configure logging based on debug flag
@@ -789,17 +845,19 @@ Examples:
         log.info(f"Note: Project processing is limited to {args.limit} per organization.")
     
     if args.workers != MAX_WORKERS:
-        log.info(f"Using {args.workers} concurrent workers")
+        log.info(f"Using {args.workers} concurrent workers.")
+
+    log.info(f"Using request timeout of {args.timeout} seconds.")
 
     # Get Snyk token and initialize client
     snyk_token = get_snyk_token()
-    client = SnykClient(snyk_token)
+    client = SnykClient(snyk_token, timeout=args.timeout)
 
     # Execute the appropriate report based on arguments
     if args.org:
         run_org_report(client, args.org, args.limit, args.detailed)
     elif args.group:
-        run_group_report(client, args.group, args.limit, args.detailed, max_workers=args.workers)
+        run_group_report(client, args.group, args.limit, args.detailed, max_workers=args.workers, batch_size=args.batch_size)
     else:
         # Interactive Mode - prompt user for scope and target
         log.info("No scope specified. Entering interactive mode.")
@@ -808,7 +866,7 @@ Examples:
                 choice = input("Analyze a (g)roup or an (o)rganization? [g/o]: ").lower().strip()
                 if choice in ['g', 'group']:
                     group_id = select_target_id(client, "group", "GROUP_IDS")
-                    run_group_report(client, group_id, args.limit, args.detailed, max_workers=args.workers)
+                    run_group_report(client, group_id, args.limit, args.detailed, max_workers=args.workers, batch_size=args.batch_size)
                     break
                 elif choice in ['o', 'org', 'organization']:
                     org_id = select_target_id(client, "org", "ORG_IDS")
